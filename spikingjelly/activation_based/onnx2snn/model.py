@@ -69,6 +69,8 @@ class OnnxGraphModule(nn.Module):
             return _pool(inputs[0], node.attrs, mode="avg")
         if node.op_type == "Concat":
             return torch.cat(inputs, dim=int(node.attrs.get("axis", 0)))
+        if node.op_type == "Constant":
+            return torch.as_tensor(node.attrs["value"])
         if node.op_type == "Flatten":
             return torch.flatten(inputs[0], start_dim=int(node.attrs.get("axis", 1)))
         if node.op_type == "GlobalAveragePool":
@@ -80,6 +82,8 @@ class OnnxGraphModule(nn.Module):
             return torch.matmul(inputs[0], inputs[1])
         if node.op_type == "MaxPool":
             return _pool(inputs[0], node.attrs, mode="max")
+        if node.op_type == "Pad":
+            return _pad(inputs, node.attrs)
         if node.op_type == "ReduceMean":
             axes = node.attrs.get("axes")
             if axes is None and len(inputs) > 1:
@@ -252,6 +256,32 @@ def _pool(x: torch.Tensor, attrs: dict[str, Any], mode: str):
     return F.max_pool2d(
         x, kernel_size=kernel, stride=stride, padding=padding, ceil_mode=ceil_mode
     )
+
+
+def _pad(inputs: list[torch.Tensor], attrs: dict[str, Any]):
+    x = inputs[0]
+    if len(inputs) > 1:
+        pads = [int(v) for v in inputs[1].detach().cpu().flatten().tolist()]
+    else:
+        pads = [int(v) for v in attrs.get("pads", [])]
+    if not pads or all(value == 0 for value in pads):
+        return x
+    value = 0.0
+    if len(inputs) > 2:
+        value = float(inputs[2].detach().cpu().flatten()[0].item())
+    mode = attrs.get("mode", "constant")
+    if isinstance(mode, bytes):
+        mode = mode.decode("utf-8")
+    mode = str(mode).lower()
+    torch_pad = []
+    dims = len(pads) // 2
+    for dim in reversed(range(dims)):
+        torch_pad.extend([pads[dim], pads[dim + dims]])
+    if mode == "constant":
+        return F.pad(x, torch_pad, mode="constant", value=value)
+    if mode == "edge":
+        mode = "replicate"
+    return F.pad(x, torch_pad, mode=mode)
 
 
 def _buffer_name(name: str) -> str:

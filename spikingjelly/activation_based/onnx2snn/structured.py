@@ -138,6 +138,7 @@ class StructuredOnnxGraphModule(OnnxGraphModule):
         out = self.conv1(x)
         out = self._apply_optional("bn1", out)
         out = self.relu(out)
+        out = self._apply_optional("maxpool", out)
         for name in self.readable_layer_names:
             out = getattr(self, name)(out)
         out = self.avgpool(out)
@@ -351,7 +352,11 @@ def _build_top_readable_aliases(
             aliases["fc"] = node.module_name
 
     for idx, node in enumerate(graph.nodes):
-        if node.op_type in {"AveragePool", "GlobalAveragePool"} and "avgpool" not in aliases:
+        if node.op_type == "MaxPool" and "maxpool" not in aliases:
+            name = f"readable_maxpool_{idx}"
+            readable_ops[name] = _make_pool_module(node)
+            aliases["maxpool"] = name
+        elif node.op_type in {"AveragePool", "GlobalAveragePool"} and "avgpool" not in aliases:
             name = f"readable_avgpool_{idx}"
             readable_ops[name] = _make_pool_module(node)
             aliases["avgpool"] = name
@@ -370,12 +375,17 @@ def _make_pool_module(node) -> nn.Module:
     pads = node.attrs.get("pads", [0, 0, 0, 0])
     if len(kernel) != 2 or pads[:2] != pads[2:]:
         return _GraphFallbackPool(node)
-    return nn.AvgPool2d(
-        kernel_size=kernel,
-        stride=stride,
-        padding=tuple(pads[:2]),
-        ceil_mode=bool(node.attrs.get("ceil_mode", 0)),
-        count_include_pad=bool(node.attrs.get("count_include_pad", 0)),
+    pool_cls = nn.MaxPool2d if node.op_type == "MaxPool" else nn.AvgPool2d
+    kwargs = {
+        "kernel_size": kernel,
+        "stride": stride,
+        "padding": tuple(pads[:2]),
+        "ceil_mode": bool(node.attrs.get("ceil_mode", 0)),
+    }
+    if pool_cls is nn.AvgPool2d:
+        kwargs["count_include_pad"] = bool(node.attrs.get("count_include_pad", 0))
+    return pool_cls(
+        **kwargs
     )
 
 
@@ -428,21 +438,53 @@ def _install_readable_resnet_aliases(
         for node in conv_nodes
         if node.inputs
         and node.inputs[0] in set(group.inputs)
-        and node.outputs
-        and node.outputs[0] in add_inputs
+        and _conv_reaches_add(node, bn_nodes, add_inputs)
     ]
     shortcut_node = shortcut_nodes[0] if shortcut_nodes else None
     main_conv_nodes = [node for node in conv_nodes if node is not shortcut_node]
-    aliases: dict[str, str | None] = {}
+    aliases: dict[str, str | tuple[str, ...] | None] = {}
     for idx, node in enumerate(main_conv_nodes, start=1):
         aliases[f"conv{idx}"] = node.module_name
     for idx, node in enumerate(_main_bn_nodes(main_conv_nodes, bn_nodes), start=1):
         aliases[f"bn{idx}"] = node.module_name
     for idx, node in enumerate(relu_nodes, start=1):
         aliases[f"relu{idx}"] = node.module_name
-    aliases["shortcut"] = shortcut_node.module_name if shortcut_node is not None else None
+    aliases["shortcut"] = _shortcut_module_ref(shortcut_node, bn_nodes, add_inputs)
     aliases["downsample"] = aliases["shortcut"]
     block.__dict__["_readable_aliases"] = aliases
+
+
+def _shortcut_module_ref(shortcut_node, bn_nodes, add_inputs):
+    if shortcut_node is None:
+        return None
+    modules = [shortcut_node.module_name]
+    for bn in bn_nodes:
+        if (
+            bn.inputs
+            and shortcut_node.outputs
+            and bn.inputs[0] == shortcut_node.outputs[0]
+            and bn.outputs
+            and bn.outputs[0] in add_inputs
+        ):
+            modules.append(bn.module_name)
+            break
+    if len(modules) == 1:
+        return modules[0]
+    return tuple(module for module in modules if module is not None)
+
+
+def _conv_reaches_add(conv_node, bn_nodes, add_inputs) -> bool:
+    if not conv_node.outputs:
+        return False
+    if conv_node.outputs[0] in add_inputs:
+        return True
+    return any(
+        bn.inputs
+        and bn.inputs[0] == conv_node.outputs[0]
+        and bn.outputs
+        and bn.outputs[0] in add_inputs
+        for bn in bn_nodes
+    )
 
 
 def _main_bn_nodes(conv_nodes, bn_nodes):

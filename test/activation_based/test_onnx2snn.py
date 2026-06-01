@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -169,6 +170,29 @@ def test_convert_vgg_like_maxpool_graph_replaces_snn_pooling(tmp_path: Path):
         assert artifacts.snn_model(x[:1]).shape == (1, 3)
 
 
+def test_convert_pad_constant_graph(tmp_path: Path):
+    torch.manual_seed(6)
+    x = torch.rand(2, 1, 8, 8)
+    onnx_path = _make_pad_constant_onnx(tmp_path / "pad.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "pad_artifacts",
+        {"input_shape": (1, 1, 8, 8), "t": 2, "compare_onnxruntime": False},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=1),
+    )
+
+    assert artifacts.report["op_counts"]["Pad"] == 1
+    with torch.no_grad():
+        assert artifacts.ann_model(x).shape == (2, 3)
+        assert torch.allclose(
+            artifacts.ann_model(x),
+            artifacts.structured_ann_model(x),
+            atol=1.0e-6,
+            rtol=1.0e-6,
+        )
+
+
 def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
     torch.manual_seed(3)
     model = _VggLikeMaxPoolNet().eval()
@@ -310,5 +334,74 @@ def _export_onnx(model: nn.Module, x: torch.Tensor, path: Path) -> Path:
         output_names=["output"],
         do_constant_folding=False,
     )
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_pad_constant_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+
+    weight = np.random.default_rng(6).standard_normal((2, 1, 3, 3)).astype(np.float32)
+    fc_weight = np.random.default_rng(7).standard_normal((3, 128)).astype(np.float32)
+    fc_bias = np.random.default_rng(8).standard_normal((3,)).astype(np.float32)
+    pads = np.array([0, 0, 1, 1, 0, 0, 1, 1], dtype=np.int64)
+    pad_value = np.array([0.0], dtype=np.float32)
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["pads"],
+                value=numpy_helper.from_array(pads, name="pads_tensor"),
+            ),
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["pad_value"],
+                value=numpy_helper.from_array(pad_value, name="pad_value_tensor"),
+            ),
+            helper.make_node(
+                "Pad",
+                inputs=["input", "pads", "pad_value"],
+                outputs=["padded"],
+                mode="constant",
+            ),
+            helper.make_node(
+                "Conv",
+                inputs=["padded", "conv_weight"],
+                outputs=["conv_out"],
+                pads=[0, 0, 0, 0],
+            ),
+            helper.make_node("Relu", inputs=["conv_out"], outputs=["relu_out"]),
+            helper.make_node("Flatten", inputs=["relu_out"], outputs=["flat"], axis=1),
+            helper.make_node(
+                "Gemm",
+                inputs=["flat", "fc_weight", "fc_bias"],
+                outputs=["output"],
+                transB=1,
+            ),
+        ],
+        "pad_constant_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [None, 1, 8, 8])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [None, 3])
+        ],
+        initializer=[
+            numpy_helper.from_array(weight, name="conv_weight"),
+            numpy_helper.from_array(fc_weight, name="fc_weight"),
+            numpy_helper.from_array(fc_bias, name="fc_bias"),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
     onnx.checker.check_model(str(path))
     return path

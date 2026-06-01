@@ -101,6 +101,8 @@ def _find_linear_activation_blocks(
 
 def _find_vgg_stages(graph: CanonicalGraph) -> list[PatternGroup]:
     groups = []
+    if sum(1 for node in graph.nodes if node.op_type == "MaxPool") < 2:
+        return groups
     start = 0
     for idx, node in enumerate(graph.nodes):
         if node.op_type != "MaxPool":
@@ -162,7 +164,7 @@ def _find_resnet_blocks(
         main_branch = max(branches, key=lambda branch: int(branch["conv_count"]))
         shortcut_branch = min(branches, key=lambda branch: int(branch["conv_count"]))
         common_conv_count = int(shortcut_branch["conv_count"])
-        shortcut_conv_count = 1 if bool(shortcut_branch["starts_with_conv"]) else 0
+        shortcut_conv_count = 1 if bool(shortcut_branch["starts_with_projection"]) else 0
         main_conv_count = (
             int(main_branch["conv_count"]) - common_conv_count + shortcut_conv_count
         )
@@ -212,7 +214,7 @@ def _trace_residual_branch(
     tensor = start_tensor
     node_indices: list[int] = []
     conv_count = 0
-    starts_with_conv = False
+    starts_with_projection = False
     seen: set[str] = set()
     while tensor and tensor not in seen:
         seen.add(tensor)
@@ -222,8 +224,6 @@ def _trace_residual_branch(
         node = graph.nodes[node_idx]
         if node.op_type not in {"Conv", "BatchNormalization", "Relu", "Identity"}:
             break
-        if not node_indices:
-            starts_with_conv = node.op_type == "Conv"
         node_indices.append(node_idx)
         if node.op_type == "Conv":
             conv_count += 1
@@ -233,8 +233,18 @@ def _trace_residual_branch(
     return {
         "node_indices": node_indices,
         "conv_count": conv_count,
-        "starts_with_conv": starts_with_conv,
+        "starts_with_projection": _starts_with_projection(graph, node_indices),
     }
+
+
+def _starts_with_projection(graph: CanonicalGraph, node_indices: list[int]) -> bool:
+    for node_idx in node_indices:
+        op_type = graph.nodes[node_idx].op_type
+        if op_type == "Conv":
+            return True
+        if op_type == "Relu":
+            return False
+    return False
 
 
 def _trim_branch_to_conv_count(
