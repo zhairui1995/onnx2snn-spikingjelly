@@ -13,6 +13,11 @@ from spikingjelly.activation_based.onnx2snn import (
 )
 from spikingjelly.activation_based.onnx2snn.loader import load_onnx_graph
 from spikingjelly.activation_based.onnx2snn.patterns import analyze_patterns
+from spikingjelly.activation_based.onnx2snn.structured import (
+    BasicBlock,
+    BottleneckBlock,
+    build_structured_ann_model,
+)
 
 onnx = pytest.importorskip("onnx")
 
@@ -107,6 +112,7 @@ def test_convert_conv_bn_relu_onnx_to_dual_artifacts(tmp_path: Path):
     assert artifacts.report["calibration"]["relu_scales"]
     for name in [
         "ann_model.pt",
+        "structured_ann_model.pt",
         "snn_model.pt",
         "conversion_config.json",
         "report.json",
@@ -212,6 +218,38 @@ def test_pattern_grouping_finds_resnet_blocks(
     assert counts["residual_add"] == expected_blocks
     assert counts[expected_pattern] == expected_blocks
     assert "vgg_stage" not in counts
+
+
+@pytest.mark.parametrize(
+    ("constructor", "block_cls", "expected_blocks"),
+    [
+        (cifar10_resnet.ResNet18, BasicBlock, 8),
+        (cifar10_resnet.ResNet50, BottleneckBlock, 16),
+    ],
+)
+def test_structured_ann_model_uses_resnet_blocks(
+    tmp_path: Path, constructor, block_cls, expected_blocks
+):
+    torch.manual_seed(5)
+    model = constructor().eval()
+    x = torch.rand(2, 3, 32, 32)
+    onnx_path = _export_onnx(model, x, tmp_path / "resnet_structured.onnx")
+    graph = load_onnx_graph(str(onnx_path))
+
+    flat_artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "structured_artifacts",
+        {"input_shape": (1, 3, 32, 32), "t": 2, "compare_onnxruntime": False},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=1),
+    )
+    structured = build_structured_ann_model(graph)
+
+    assert sum(1 for module in structured.modules() if isinstance(module, block_cls)) == expected_blocks
+    with torch.no_grad():
+        flat_out = flat_artifacts.ann_model(x)
+        structured_out = structured(x)
+    assert torch.allclose(flat_out, structured_out, atol=1.0e-6, rtol=1.0e-6)
+    assert flat_artifacts.report["structured_ann"]["allclose_1e_6"]
 
 
 def test_unsupported_operator_report_is_explicit(tmp_path: Path):

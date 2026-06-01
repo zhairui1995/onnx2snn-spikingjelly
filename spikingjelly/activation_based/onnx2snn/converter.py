@@ -14,6 +14,7 @@ from .core import ConversionArtifacts, ConversionConfig
 from .loader import load_onnx_graph
 from .model import build_ann_model, build_snn_model, build_snn_surrogate_ann_model
 from .patterns import analyze_patterns, pattern_report
+from .structured import build_structured_ann_model
 
 
 def convert_onnx_to_snn(
@@ -33,6 +34,7 @@ def convert_onnx_to_snn(
     graph = load_onnx_graph(str(onnx_path))
     pattern_groups = analyze_patterns(graph)
     ann_model = build_ann_model(graph).to(cfg.device).eval()
+    structured_ann_model = build_structured_ann_model(graph).to(cfg.device).eval()
     calibration_model = build_snn_surrogate_ann_model(
         ann_model,
         replace_maxpool_with_avgpool=cfg.replace_maxpool_with_avgpool_in_snn,
@@ -58,6 +60,9 @@ def convert_onnx_to_snn(
         "node_count": len(graph.nodes),
         "op_counts": _op_counts(graph.nodes),
         "pattern_groups": pattern_report(pattern_groups),
+        "structured_ann": _compare_models(
+            ann_model, structured_ann_model, calibration_batches, cfg
+        ),
         "synthetic_calibration_used": synthetic_used,
         "calibration": calibration_stats,
         "snn_graph_transform": {
@@ -81,9 +86,18 @@ def convert_onnx_to_snn(
             else None,
         )
 
-    _write_artifacts(output_dir, ann_model, snn_model, cfg, calibration_stats, report)
+    _write_artifacts(
+        output_dir,
+        ann_model,
+        structured_ann_model,
+        snn_model,
+        cfg,
+        calibration_stats,
+        report,
+    )
     return ConversionArtifacts(
         ann_model=ann_model,
+        structured_ann_model=structured_ann_model,
         snn_model=snn_model,
         config=cfg,
         calibration_stats=calibration_stats,
@@ -214,6 +228,29 @@ def _compare_onnxruntime(
     }
 
 
+def _compare_models(
+    reference_model: nn.Module,
+    candidate_model: nn.Module,
+    batches: list[torch.Tensor],
+    cfg: ConversionConfig,
+) -> dict[str, Any]:
+    if not batches:
+        return {"status": "skipped", "reason": "no calibration/sample batch"}
+    x = batches[0].to(cfg.device)
+    with torch.no_grad():
+        reference_out = reference_model(x).detach().cpu().numpy()
+        candidate_out = candidate_model(x).detach().cpu().numpy()
+    diff = np.asarray(reference_out) - np.asarray(candidate_out)
+    return {
+        "status": "ok",
+        "max_abs_error": float(np.max(np.abs(diff))),
+        "mean_abs_error": float(np.mean(np.abs(diff))),
+        "allclose_1e_6": bool(
+            np.allclose(reference_out, candidate_out, atol=1.0e-6, rtol=1.0e-6)
+        ),
+    }
+
+
 def _evaluate_models(
     ann_model: nn.Module,
     snn_model: nn.Module,
@@ -264,12 +301,15 @@ def _evaluate_models(
 def _write_artifacts(
     output_dir: Path,
     ann_model: nn.Module,
+    structured_ann_model: nn.Module | None,
     snn_model: nn.Module,
     cfg: ConversionConfig,
     calibration_stats: dict[str, Any],
     report: dict[str, Any],
 ) -> None:
     torch.save(ann_model, output_dir / "ann_model.pt")
+    if structured_ann_model is not None:
+        torch.save(structured_ann_model, output_dir / "structured_ann_model.pt")
     torch.save(snn_model, output_dir / "snn_model.pt")
     (output_dir / "conversion_config.json").write_text(
         json.dumps(cfg.to_dict(), indent=2, sort_keys=True),
@@ -306,12 +346,16 @@ from spikingjelly.activation_based import functional
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["ann", "snn"], default="snn")
+    parser.add_argument("--model", choices=["ann", "structured_ann", "snn"], default="snn")
     parser.add_argument("--input", required=True, help="Path to a torch tensor .pt file")
     parser.add_argument("--steps", type=int, default=50)
     args = parser.parse_args()
 
-    model_path = "ann_model.pt" if args.model == "ann" else "snn_model.pt"
+    model_path = {
+        "ann": "ann_model.pt",
+        "structured_ann": "structured_ann_model.pt",
+        "snn": "snn_model.pt",
+    }[args.model]
     model = torch.load(model_path, map_location="cpu", weights_only=False).eval()
     x = torch.load(args.input, map_location="cpu", weights_only=False)
     if args.model == "ann":

@@ -63,6 +63,7 @@ class ConversionArtifacts:
     """Conversion outputs returned by :func:`convert_onnx_to_snn`."""
 
     ann_model: nn.Module
+    structured_ann_model: nn.Module | None
     snn_model: nn.Module
     config: ConversionConfig
     calibration_stats: dict[str, Any]

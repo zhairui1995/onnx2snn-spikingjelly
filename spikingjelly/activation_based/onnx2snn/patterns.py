@@ -279,7 +279,7 @@ def _make_group(
     nodes = [graph.nodes[idx] for idx in node_indices]
     produced = {output for node in nodes for output in node.outputs}
     consumed = {input_name for node in nodes for input_name in node.inputs if input_name}
-    external_inputs = sorted(consumed - produced)
+    external_inputs = sorted((consumed - produced) - set(graph.initializers))
     external_outputs = [
         output
         for output in nodes[-1].outputs
