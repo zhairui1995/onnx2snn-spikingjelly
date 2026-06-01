@@ -91,6 +91,21 @@ class CanonicalGraph:
     module_kinds: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class PatternGroup:
+    name: str
+    pattern_type: str
+    node_indices: list[int]
+    node_names: list[str]
+    op_types: list[str]
+    inputs: list[str]
+    outputs: list[str]
+    attrs: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class UnsupportedONNXError(RuntimeError):
     """Raised when the ONNX graph uses operators outside the v1 scope."""
 

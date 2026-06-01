@@ -13,6 +13,7 @@ from spikingjelly.activation_based import functional
 from .core import ConversionArtifacts, ConversionConfig
 from .loader import load_onnx_graph
 from .model import build_ann_model, build_snn_model, build_snn_surrogate_ann_model
+from .patterns import analyze_patterns, pattern_report
 
 
 def convert_onnx_to_snn(
@@ -30,6 +31,7 @@ def convert_onnx_to_snn(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     graph = load_onnx_graph(str(onnx_path))
+    pattern_groups = analyze_patterns(graph)
     ann_model = build_ann_model(graph).to(cfg.device).eval()
     calibration_model = build_snn_surrogate_ann_model(
         ann_model,
@@ -55,6 +57,7 @@ def convert_onnx_to_snn(
         "output_names": graph.output_names,
         "node_count": len(graph.nodes),
         "op_counts": _op_counts(graph.nodes),
+        "pattern_groups": pattern_report(pattern_groups),
         "synthetic_calibration_used": synthetic_used,
         "calibration": calibration_stats,
         "snn_graph_transform": {

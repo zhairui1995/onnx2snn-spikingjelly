@@ -11,6 +11,7 @@ from spikingjelly.activation_based.onnx2snn import (
     convert_onnx_to_snn,
 )
 from spikingjelly.activation_based.onnx2snn.loader import load_onnx_graph
+from spikingjelly.activation_based.onnx2snn.patterns import analyze_patterns
 
 onnx = pytest.importorskip("onnx")
 
@@ -128,6 +129,7 @@ def test_convert_residual_add_graph(tmp_path: Path):
     )
 
     assert artifacts.report["op_counts"]["Add"] >= 1
+    assert artifacts.report["pattern_groups"]["counts"]["residual_add"] == 1
     assert len(artifacts.report["calibration"]["relu_scales"]) >= 2
     with torch.no_grad():
         assert artifacts.snn_model(x[:1]).shape == (1, 2)
@@ -147,12 +149,40 @@ def test_convert_vgg_like_maxpool_graph_replaces_snn_pooling(tmp_path: Path):
     )
 
     assert artifacts.report["op_counts"]["MaxPool"] == 2
+    assert artifacts.report["pattern_groups"]["counts"]["vgg_stage"] == 2
+    conv_block_count = artifacts.report["pattern_groups"]["counts"].get(
+        "conv_bn_relu", 0
+    ) + artifacts.report["pattern_groups"]["counts"].get("conv_relu", 0)
+    assert conv_block_count == 2
     assert artifacts.report["snn_graph_transform"]["maxpool_to_avgpool_count"] == 2
     assert "MaxPool" not in {node.op_type for node in artifacts.snn_model.graph.nodes}
     assert artifacts.report["calibration"]["relu_scales"]
     with torch.no_grad():
         assert artifacts.ann_model(x[:1]).shape == (1, 3)
         assert artifacts.snn_model(x[:1]).shape == (1, 3)
+
+
+def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
+    torch.manual_seed(3)
+    model = _VggLikeMaxPoolNet().eval()
+    onnx_path = _export_onnx(model, torch.rand(1, 3, 8, 8), tmp_path / "vgg_patterns.onnx")
+    graph = load_onnx_graph(str(onnx_path))
+
+    groups = analyze_patterns(graph)
+    vgg_stages = [group for group in groups if group.pattern_type == "vgg_stage"]
+    conv_blocks = [
+        group
+        for group in groups
+        if group.pattern_type in {"conv_bn_relu", "conv_relu"}
+    ]
+
+    assert len(vgg_stages) == 2
+    assert len(conv_blocks) == 2
+    assert vgg_stages[0].op_types[-1] == "MaxPool"
+    assert conv_blocks[0].op_types in (
+        ["Conv", "BatchNormalization", "Relu"],
+        ["Conv", "Relu"],
+    )
 
 
 def test_unsupported_operator_report_is_explicit(tmp_path: Path):
