@@ -262,6 +262,15 @@ def test_structured_ann_model_uses_resnet_blocks(
         if isinstance(module, block_cls) and isinstance(module.shortcut, nn.Conv2d)
     ]
     assert projection_blocks
+    for module in structured.modules():
+        if isinstance(module, block_cls):
+            object.__setattr__(
+                module,
+                "_graph_forward",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("standard ResNet forward should be used")
+                ),
+            )
     with torch.no_grad():
         flat_out = flat_artifacts.ann_model(x)
         structured_out = structured(x)

@@ -14,15 +14,28 @@ class _ReadableResidualBlock(OnnxGraphModule):
     def __getattr__(self, name: str):
         aliases = self.__dict__.get("_readable_aliases", {})
         if name in aliases:
-            module_name = aliases[name]
-            if module_name is None:
+            module_ref = aliases[name]
+            if module_ref is None:
                 return self.__dict__.setdefault("_identity_shortcut", nn.Identity())
-            return self.ops[module_name]
+            if isinstance(module_ref, tuple):
+                return nn.Sequential(*(self.ops[module_name] for module_name in module_ref))
+            return self.ops[module_ref]
         return super().__getattr__(name)
 
     @property
     def readable_layer_names(self) -> tuple[str, ...]:
         return tuple(self.__dict__.get("_readable_aliases", {}))
+
+    def _graph_forward(self, *args, **kwargs):
+        return super().forward(*args, **kwargs)
+
+    def _has_readable_alias(self, name: str) -> bool:
+        return name in self.__dict__.get("_readable_aliases", {})
+
+    def _apply_optional(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        if self._has_readable_alias(name):
+            return getattr(self, name)(x)
+        return x
 
     def extra_repr(self) -> str:
         aliases = self.__dict__.get("_readable_aliases", {})
@@ -38,9 +51,40 @@ class _ReadableResidualBlock(OnnxGraphModule):
 class BasicBlock(_ReadableResidualBlock):
     """Executable ResNet BasicBlock rebuilt from an ONNX residual subgraph."""
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            identity = self.shortcut(x)
+            out = self.conv1(x)
+            out = self._apply_optional("bn1", out)
+            out = self.relu1(out)
+            out = self.conv2(out)
+            out = self._apply_optional("bn2", out)
+            out = out + identity
+            out = self.relu2(out)
+            return out
+        except (AttributeError, RuntimeError, TypeError):
+            return self._graph_forward(x)
+
 
 class BottleneckBlock(_ReadableResidualBlock):
     """Executable ResNet Bottleneck block rebuilt from an ONNX residual subgraph."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            identity = self.shortcut(x)
+            out = self.conv1(x)
+            out = self._apply_optional("bn1", out)
+            out = self.relu1(out)
+            out = self.conv2(out)
+            out = self._apply_optional("bn2", out)
+            out = self.relu2(out)
+            out = self.conv3(out)
+            out = self._apply_optional("bn3", out)
+            out = out + identity
+            out = self.relu3(out)
+            return out
+        except (AttributeError, RuntimeError, TypeError):
+            return self._graph_forward(x)
 
 
 class StructuredOnnxGraphModule(OnnxGraphModule):
@@ -204,6 +248,11 @@ def _install_readable_resnet_aliases(
         for node in block.graph.nodes
         if node.op_type == "Relu" and node.module_name is not None
     ]
+    bn_nodes = [
+        node
+        for node in block.graph.nodes
+        if node.op_type == "BatchNormalization" and node.module_name is not None
+    ]
     add_inputs = {
         input_name
         for node in block.graph.nodes
@@ -223,11 +272,26 @@ def _install_readable_resnet_aliases(
     aliases: dict[str, str | None] = {}
     for idx, node in enumerate(main_conv_nodes, start=1):
         aliases[f"conv{idx}"] = node.module_name
+    for idx, node in enumerate(_main_bn_nodes(main_conv_nodes, bn_nodes), start=1):
+        aliases[f"bn{idx}"] = node.module_name
     for idx, node in enumerate(relu_nodes, start=1):
         aliases[f"relu{idx}"] = node.module_name
     aliases["shortcut"] = shortcut_node.module_name if shortcut_node is not None else None
     aliases["downsample"] = aliases["shortcut"]
     block.__dict__["_readable_aliases"] = aliases
+
+
+def _main_bn_nodes(conv_nodes, bn_nodes):
+    bn_by_input = {
+        node.inputs[0]: node
+        for node in bn_nodes
+        if node.inputs
+    }
+    ordered = []
+    for conv in conv_nodes:
+        if conv.outputs and conv.outputs[0] in bn_by_input:
+            ordered.append(bn_by_input[conv.outputs[0]])
+    return ordered
 
 
 def _used_initializers(graph: CanonicalGraph, nodes) -> dict:
