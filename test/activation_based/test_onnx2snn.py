@@ -245,6 +245,23 @@ def test_structured_ann_model_uses_resnet_blocks(
     structured = build_structured_ann_model(graph)
 
     assert sum(1 for module in structured.modules() if isinstance(module, block_cls)) == expected_blocks
+    first_block = next(module for module in structured.modules() if isinstance(module, block_cls))
+    assert isinstance(first_block.conv1, nn.Conv2d)
+    assert isinstance(first_block.relu1, nn.ReLU)
+    assert "shortcut" in first_block.readable_layer_names
+    if block_cls is BasicBlock:
+        assert isinstance(first_block.conv2, nn.Conv2d)
+        assert isinstance(first_block.relu2, nn.ReLU)
+    else:
+        assert isinstance(first_block.conv2, nn.Conv2d)
+        assert isinstance(first_block.conv3, nn.Conv2d)
+        assert isinstance(first_block.relu3, nn.ReLU)
+    projection_blocks = [
+        module
+        for module in structured.modules()
+        if isinstance(module, block_cls) and isinstance(module.shortcut, nn.Conv2d)
+    ]
+    assert projection_blocks
     with torch.no_grad():
         flat_out = flat_artifacts.ann_model(x)
         structured_out = structured(x)

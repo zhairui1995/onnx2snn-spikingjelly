@@ -10,11 +10,36 @@ from .model import OnnxGraphModule, build_ann_model
 from .patterns import analyze_patterns
 
 
-class BasicBlock(OnnxGraphModule):
+class _ReadableResidualBlock(OnnxGraphModule):
+    def __getattr__(self, name: str):
+        aliases = self.__dict__.get("_readable_aliases", {})
+        if name in aliases:
+            module_name = aliases[name]
+            if module_name is None:
+                return self.__dict__.setdefault("_identity_shortcut", nn.Identity())
+            return self.ops[module_name]
+        return super().__getattr__(name)
+
+    @property
+    def readable_layer_names(self) -> tuple[str, ...]:
+        return tuple(self.__dict__.get("_readable_aliases", {}))
+
+    def extra_repr(self) -> str:
+        aliases = self.__dict__.get("_readable_aliases", {})
+        if not aliases:
+            return ""
+        pairs = [
+            f"{name}->{module_name or 'Identity'}"
+            for name, module_name in aliases.items()
+        ]
+        return "readable_aliases=" + ", ".join(pairs)
+
+
+class BasicBlock(_ReadableResidualBlock):
     """Executable ResNet BasicBlock rebuilt from an ONNX residual subgraph."""
 
 
-class BottleneckBlock(OnnxGraphModule):
+class BottleneckBlock(_ReadableResidualBlock):
     """Executable ResNet Bottleneck block rebuilt from an ONNX residual subgraph."""
 
 
@@ -161,7 +186,48 @@ def _build_block_module(
             if name in graph.module_kinds
         },
     )
-    return block_cls(subgraph, modules).eval()
+    block = block_cls(subgraph, modules).eval()
+    _install_readable_resnet_aliases(block, group)
+    return block
+
+
+def _install_readable_resnet_aliases(
+    block: _ReadableResidualBlock, group: PatternGroup
+) -> None:
+    conv_nodes = [
+        node
+        for node in block.graph.nodes
+        if node.op_type == "Conv" and node.module_name is not None
+    ]
+    relu_nodes = [
+        node
+        for node in block.graph.nodes
+        if node.op_type == "Relu" and node.module_name is not None
+    ]
+    add_inputs = {
+        input_name
+        for node in block.graph.nodes
+        if node.op_type == "Add"
+        for input_name in node.inputs
+    }
+    shortcut_nodes = [
+        node
+        for node in conv_nodes
+        if node.inputs
+        and node.inputs[0] in set(group.inputs)
+        and node.outputs
+        and node.outputs[0] in add_inputs
+    ]
+    shortcut_node = shortcut_nodes[0] if shortcut_nodes else None
+    main_conv_nodes = [node for node in conv_nodes if node is not shortcut_node]
+    aliases: dict[str, str | None] = {}
+    for idx, node in enumerate(main_conv_nodes, start=1):
+        aliases[f"conv{idx}"] = node.module_name
+    for idx, node in enumerate(relu_nodes, start=1):
+        aliases[f"relu{idx}"] = node.module_name
+    aliases["shortcut"] = shortcut_node.module_name if shortcut_node is not None else None
+    aliases["downsample"] = aliases["shortcut"]
+    block.__dict__["_readable_aliases"] = aliases
 
 
 def _used_initializers(graph: CanonicalGraph, nodes) -> dict:
