@@ -96,17 +96,72 @@ class StructuredOnnxGraphModule(OnnxGraphModule):
         modules: dict[str, nn.Module],
         blocks: dict[str, OnnxGraphModule],
         block_specs: dict[int, dict],
+        top_aliases: dict[str, str] | None = None,
+        readable_ops: dict[str, nn.Module] | None = None,
+        readable_layers: dict[str, nn.Sequential] | None = None,
     ):
         super().__init__(graph, modules)
         self.blocks = nn.ModuleDict(blocks)
+        self.readable_ops = nn.ModuleDict(readable_ops or {})
+        self.readable_layers = nn.ModuleDict(readable_layers or {})
+        self.__dict__["_top_readable_aliases"] = top_aliases or {}
         self.block_specs = block_specs
         self.block_node_indices = {
             node_idx
             for spec in block_specs.values()
             for node_idx in spec["node_indices"]
         }
+        self.__dict__["_resnet_forward_available"] = bool(readable_layers)
+
+    def __getattr__(self, name: str):
+        aliases = self.__dict__.get("_top_readable_aliases", {})
+        if name in aliases:
+            module_name = aliases[name]
+            ops = self._modules["ops"]
+            if module_name in ops:
+                return ops[module_name]
+            return self._modules["readable_ops"][module_name]
+        readable_layers = self._modules.get("readable_layers")
+        if readable_layers is not None and name in readable_layers:
+            return readable_layers[name]
+        return super().__getattr__(name)
 
     def forward(self, *args, **kwargs):
+        if self.__dict__.get("_resnet_forward_available") and not kwargs and len(args) == 1:
+            try:
+                return self._resnet_forward(args[0])
+            except (AttributeError, RuntimeError, TypeError):
+                return self._graph_forward(*args, **kwargs)
+        return self._graph_forward(*args, **kwargs)
+
+    def _resnet_forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(x)
+        out = self._apply_optional("bn1", out)
+        out = self.relu(out)
+        for name in self.readable_layer_names:
+            out = getattr(self, name)(out)
+        out = self.avgpool(out)
+        out = self.flatten(out)
+        out = self.fc(out)
+        return out
+
+    @property
+    def readable_layer_names(self) -> tuple[str, ...]:
+        return tuple(self._modules["readable_layers"].keys())
+
+    @property
+    def readable_top_names(self) -> tuple[str, ...]:
+        return tuple(self.__dict__.get("_top_readable_aliases", {}))
+
+    def _has_readable_alias(self, name: str) -> bool:
+        return name in self.__dict__.get("_top_readable_aliases", {})
+
+    def _apply_optional(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        if self._has_readable_alias(name):
+            return getattr(self, name)(x)
+        return x
+
+    def _graph_forward(self, *args, **kwargs):
         env: dict[str, torch.Tensor] = {}
         if kwargs:
             for name in self.graph.input_names:
@@ -187,7 +242,17 @@ def build_structured_ann_model(graph: CanonicalGraph) -> StructuredOnnxGraphModu
             "pattern_type": group.pattern_type,
         }
 
-    model = StructuredOnnxGraphModule(graph, top_modules, blocks, block_specs)
+    top_aliases, readable_ops = _build_top_readable_aliases(graph, top_modules)
+    readable_layers = _build_readable_resnet_layers(blocks)
+    model = StructuredOnnxGraphModule(
+        graph,
+        top_modules,
+        blocks,
+        block_specs,
+        top_aliases=top_aliases,
+        readable_ops=readable_ops,
+        readable_layers=readable_layers,
+    )
     model.eval()
     return model
 
@@ -233,6 +298,105 @@ def _build_block_module(
     block = block_cls(subgraph, modules).eval()
     _install_readable_resnet_aliases(block, group)
     return block
+
+
+def _build_readable_resnet_layers(
+    blocks: dict[str, OnnxGraphModule]
+) -> dict[str, nn.Sequential]:
+    stages: list[list[OnnxGraphModule]] = []
+    current_stage: list[OnnxGraphModule] = []
+    previous_channels = None
+    for block in blocks.values():
+        channels = _block_output_channels(block)
+        if current_stage and channels != previous_channels:
+            stages.append(current_stage)
+            current_stage = []
+        current_stage.append(block)
+        previous_channels = channels
+    if current_stage:
+        stages.append(current_stage)
+    return {
+        f"layer{idx}": nn.Sequential(*stage)
+        for idx, stage in enumerate(stages, start=1)
+    }
+
+
+def _block_output_channels(block: OnnxGraphModule) -> int | None:
+    for name in ("conv3", "conv2", "conv1"):
+        try:
+            module = getattr(block, name)
+        except AttributeError:
+            continue
+        if isinstance(module, nn.Conv2d):
+            return int(module.out_channels)
+    return None
+
+
+def _build_top_readable_aliases(
+    graph: CanonicalGraph, top_modules: dict[str, nn.Module]
+) -> tuple[dict[str, str], dict[str, nn.Module]]:
+    aliases: dict[str, str] = {}
+    readable_ops: dict[str, nn.Module] = {}
+    top_module_names = set(top_modules)
+    for node in graph.nodes:
+        if node.module_name not in top_module_names:
+            continue
+        if node.op_type == "Conv" and "conv1" not in aliases:
+            aliases["conv1"] = node.module_name
+        elif node.op_type == "BatchNormalization" and "bn1" not in aliases:
+            aliases["bn1"] = node.module_name
+        elif node.op_type == "Relu" and "relu" not in aliases:
+            aliases["relu"] = node.module_name
+        elif node.op_type == "Gemm":
+            aliases["fc"] = node.module_name
+
+    for idx, node in enumerate(graph.nodes):
+        if node.op_type in {"AveragePool", "GlobalAveragePool"} and "avgpool" not in aliases:
+            name = f"readable_avgpool_{idx}"
+            readable_ops[name] = _make_pool_module(node)
+            aliases["avgpool"] = name
+        elif node.op_type in {"Flatten", "Reshape"} and "flatten" not in aliases:
+            name = f"readable_flatten_{idx}"
+            readable_ops[name] = nn.Flatten(start_dim=int(node.attrs.get("axis", 1)))
+            aliases["flatten"] = name
+    return aliases, readable_ops
+
+
+def _make_pool_module(node) -> nn.Module:
+    if node.op_type == "GlobalAveragePool":
+        return nn.AdaptiveAvgPool2d((1, 1))
+    kernel = tuple(node.attrs.get("kernel_shape", []))
+    stride = tuple(node.attrs.get("strides", kernel))
+    pads = node.attrs.get("pads", [0, 0, 0, 0])
+    if len(kernel) != 2 or pads[:2] != pads[2:]:
+        return _GraphFallbackPool(node)
+    return nn.AvgPool2d(
+        kernel_size=kernel,
+        stride=stride,
+        padding=tuple(pads[:2]),
+        ceil_mode=bool(node.attrs.get("ceil_mode", 0)),
+        count_include_pad=bool(node.attrs.get("count_include_pad", 0)),
+    )
+
+
+class _GraphFallbackPool(nn.Module):
+    def __init__(self, node):
+        super().__init__()
+        self.node = copy.deepcopy(node)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        env = {self.node.inputs[0]: x}
+        return OnnxGraphModule(
+            CanonicalGraph(
+                input_names=[self.node.inputs[0]],
+                output_names=list(self.node.outputs),
+                nodes=[self.node],
+                initializers={},
+                value_shapes={},
+                opset_imports={},
+            ),
+            {},
+        )._run_node(self.node, env)
 
 
 def _install_readable_resnet_aliases(

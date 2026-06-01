@@ -221,14 +221,14 @@ def test_pattern_grouping_finds_resnet_blocks(
 
 
 @pytest.mark.parametrize(
-    ("constructor", "block_cls", "expected_blocks"),
+    ("constructor", "block_cls", "expected_blocks", "expected_stage_sizes"),
     [
-        (cifar10_resnet.ResNet18, BasicBlock, 8),
-        (cifar10_resnet.ResNet50, BottleneckBlock, 16),
+        (cifar10_resnet.ResNet18, BasicBlock, 8, [2, 2, 2, 2]),
+        (cifar10_resnet.ResNet50, BottleneckBlock, 16, [3, 4, 6, 3]),
     ],
 )
 def test_structured_ann_model_uses_resnet_blocks(
-    tmp_path: Path, constructor, block_cls, expected_blocks
+    tmp_path: Path, constructor, block_cls, expected_blocks, expected_stage_sizes
 ):
     torch.manual_seed(5)
     model = constructor().eval()
@@ -245,6 +245,13 @@ def test_structured_ann_model_uses_resnet_blocks(
     structured = build_structured_ann_model(graph)
 
     assert sum(1 for module in structured.modules() if isinstance(module, block_cls)) == expected_blocks
+    assert isinstance(structured.conv1, nn.Conv2d)
+    assert isinstance(structured.relu, nn.ReLU)
+    assert isinstance(structured.avgpool, nn.AvgPool2d)
+    assert isinstance(structured.flatten, nn.Flatten)
+    assert isinstance(structured.fc, nn.Linear)
+    assert structured.readable_layer_names == ("layer1", "layer2", "layer3", "layer4")
+    assert [len(getattr(structured, name)) for name in structured.readable_layer_names] == expected_stage_sizes
     first_block = next(module for module in structured.modules() if isinstance(module, block_cls))
     assert isinstance(first_block.conv1, nn.Conv2d)
     assert isinstance(first_block.relu1, nn.ReLU)
@@ -271,6 +278,13 @@ def test_structured_ann_model_uses_resnet_blocks(
                     AssertionError("standard ResNet forward should be used")
                 ),
             )
+    object.__setattr__(
+        structured,
+        "_graph_forward",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("standard top-level ResNet forward should be used")
+        ),
+    )
     with torch.no_grad():
         flat_out = flat_artifacts.ann_model(x)
         structured_out = structured(x)
