@@ -1,0 +1,177 @@
+from pathlib import Path
+
+import pytest
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from spikingjelly.activation_based.onnx2snn import (
+    ConversionConfig,
+    UnsupportedONNXError,
+    convert_onnx_to_snn,
+)
+from spikingjelly.activation_based.onnx2snn.loader import load_onnx_graph
+
+onnx = pytest.importorskip("onnx")
+
+
+class _ConvBnRelu(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 4, 3, padding=1, bias=False),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.AvgPool2d(2),
+            nn.Flatten(),
+            nn.Linear(4 * 4 * 4, 3),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _ResidualBlockNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(2, 2, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(2)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(2, 2, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(2)
+        self.relu2 = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(2, 2)
+
+    def forward(self, x):
+        identity = x
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.relu2(out + identity)
+        out = self.pool(out)
+        return self.fc(self.flatten(out))
+
+
+class _VggLikeMaxPoolNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 4, 3, padding=1),
+            nn.BatchNorm2d(4),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(4, 8, 3, padding=1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten(),
+            nn.Linear(8 * 2 * 2, 3),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _UnsupportedSigmoid(nn.Module):
+    def forward(self, x):
+        return torch.sigmoid(x)
+
+
+def test_convert_conv_bn_relu_onnx_to_dual_artifacts(tmp_path: Path):
+    torch.manual_seed(0)
+    model = _ConvBnRelu().eval()
+    x = torch.rand(4, 1, 8, 8)
+    onnx_path = _export_onnx(model, x, tmp_path / "conv_bn_relu.onnx")
+    loader = DataLoader(TensorDataset(x, torch.tensor([0, 1, 2, 1])), batch_size=2)
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "artifacts",
+        ConversionConfig(input_shape=(1, 1, 8, 8), t=4, compare_onnxruntime=True),
+        calibration_loader=loader,
+        eval_loader=loader,
+    )
+
+    with torch.no_grad():
+        ann_out = artifacts.ann_model(x[:2])
+        snn_out = artifacts.snn_model(x[:2])
+
+    assert ann_out.shape == (2, 3)
+    assert snn_out.shape == (2, 3)
+    assert artifacts.report["op_counts"]["Conv"] >= 1
+    assert artifacts.report["evaluation"]["num_samples"] == 4
+    assert artifacts.report["calibration"]["relu_scales"]
+    for name in [
+        "ann_model.pt",
+        "snn_model.pt",
+        "conversion_config.json",
+        "report.json",
+        "run_inference.py",
+        "evaluate.py",
+    ]:
+        assert (tmp_path / "artifacts" / name).exists()
+
+
+def test_convert_residual_add_graph(tmp_path: Path):
+    torch.manual_seed(1)
+    model = _ResidualBlockNet().eval()
+    x = torch.rand(3, 2, 8, 8)
+    onnx_path = _export_onnx(model, x, tmp_path / "residual.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "residual_artifacts",
+        {"input_shape": (1, 2, 8, 8), "t": 3, "compare_onnxruntime": False},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=1),
+    )
+
+    assert artifacts.report["op_counts"]["Add"] >= 1
+    assert len(artifacts.report["calibration"]["relu_scales"]) >= 2
+    with torch.no_grad():
+        assert artifacts.snn_model(x[:1]).shape == (1, 2)
+
+
+def test_convert_vgg_like_maxpool_graph_replaces_snn_pooling(tmp_path: Path):
+    torch.manual_seed(2)
+    model = _VggLikeMaxPoolNet().eval()
+    x = torch.rand(4, 3, 8, 8)
+    onnx_path = _export_onnx(model, x, tmp_path / "vgg_like.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "vgg_artifacts",
+        {"input_shape": (1, 3, 8, 8), "t": 3, "compare_onnxruntime": False},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    assert artifacts.report["op_counts"]["MaxPool"] == 2
+    assert artifacts.report["snn_graph_transform"]["maxpool_to_avgpool_count"] == 2
+    assert "MaxPool" not in {node.op_type for node in artifacts.snn_model.graph.nodes}
+    assert artifacts.report["calibration"]["relu_scales"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x[:1]).shape == (1, 3)
+        assert artifacts.snn_model(x[:1]).shape == (1, 3)
+
+
+def test_unsupported_operator_report_is_explicit(tmp_path: Path):
+    x = torch.rand(1, 3)
+    onnx_path = _export_onnx(_UnsupportedSigmoid().eval(), x, tmp_path / "bad.onnx")
+
+    with pytest.raises(UnsupportedONNXError, match="Sigmoid"):
+        load_onnx_graph(str(onnx_path))
+
+
+def _export_onnx(model: nn.Module, x: torch.Tensor, path: Path) -> Path:
+    torch.onnx.export(
+        model,
+        x,
+        str(path),
+        opset_version=13,
+        input_names=["input"],
+        output_names=["output"],
+        do_constant_folding=False,
+    )
+    onnx.checker.check_model(str(path))
+    return path

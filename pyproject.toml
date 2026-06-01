@@ -33,6 +33,7 @@ dependencies = [
     "SciencePlots",
     "h5py",
     "pydantic",
+    "requests",
 ]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
@@ -48,6 +49,7 @@ cupy12 = ["cupy-cuda12x"]
 triton = ["triton>=3.3.1"]
 nir = ["nir", "nirtorch"]
 lightning = ["lightning", "jsonargparse[signatures]"]
+onnx2snn = ["onnx", "onnxruntime", "onnx2torch", "onnxscript"]
 
 [dependency-groups]
 dev = [

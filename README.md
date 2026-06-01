@@ -34,6 +34,30 @@ The [documentation](https://spikingjelly.readthedocs.io) of SpikingJelly is writ
 - [Contribution](#contribution)
 - [About](#about)
 
+## ONNX-to-SNN Fork Experiment Notes
+
+This fork is adding a conversion path for pretrained ONNX classification models:
+
+```text
+ONNX -> Canonical Graph IR -> structured PyTorch ANN + SpikingJelly SNN
+```
+
+Current CIFAR-10 smoke experiments use `calib_size=256`, `eval_size=64`, `T=64`, and `scale_mode=99.9%`. On local Apple Silicon machines, experiments use the PyTorch MPS device by default.
+
+| Model | Rebuilt ANN accuracy | SNN accuracy | Relative accuracy | Notes |
+| --- | ---: | ---: | ---: | --- |
+| ResNet18 CIFAR-10 | 0.9375 | 0.90625 | 0.9667 | Passes the `SNN >= 0.95 * ANN` stage target |
+| VGG16-BN CIFAR-10, keeping MaxPool | 0.921875 | 0.90625 | 0.9831 | Passes the stage target |
+| VGG16-BN CIFAR-10, replacing MaxPool with AvgPool after training in the SNN path | 0.921875 | 0.09375 | 0.1017 | Does not pass the stage target |
+
+The VGG16-BN ablation shows that ONNX reconstruction is numerically aligned: ONNXRuntime vs rebuilt ANN has a maximum absolute error of `3.81e-06`. However, for an already trained VGG16-BN checkpoint, replacing all 5 `MaxPool` operators with `AvgPool` after training destroys the surrogate ANN accuracy first; the surrogate ANN accuracy is only `0.109375`. The large SNN drop therefore comes mainly from the pooling replacement itself, not from ONNX reconstruction or IFNode replacement.
+
+Recommended practice:
+
+- For pretrained VGG/MaxPool models, keep `MaxPool` by default during ANN-to-SNN conversion to preserve the 95% relative-performance target.
+- If `AvgPool` is required, train the ANN with AvgPool from the start, or fine-tune/recalibrate after replacing MaxPool. Do not directly hard-replace MaxPool in an already trained checkpoint and expect accuracy to hold.
+- The next implementation phase is pattern grouping: recognize `Conv-BN-ReLU`, VGG stages, ResNet residual blocks, and similar graph patterns as more readable and editable structured modules.
+
 ## Changelog
 
 We are actively maintaining and improving SpikingJelly. This section summarizes the current project status and recent updates.
