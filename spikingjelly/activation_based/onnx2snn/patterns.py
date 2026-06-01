@@ -9,11 +9,13 @@ def analyze_patterns(graph: CanonicalGraph) -> list[PatternGroup]:
     """Find editable high-level patterns in a canonical ONNX graph."""
 
     consumers = _build_consumers(graph)
+    producers = _build_producers(graph)
     groups: list[PatternGroup] = []
     groups.extend(_find_conv_activation_blocks(graph, consumers))
     groups.extend(_find_linear_activation_blocks(graph, consumers))
     groups.extend(_find_vgg_stages(graph))
     groups.extend(_find_residual_adds(graph, consumers))
+    groups.extend(_find_resnet_blocks(graph, consumers, producers))
     return groups
 
 
@@ -32,6 +34,14 @@ def _build_consumers(graph: CanonicalGraph) -> dict[str, list[int]]:
             if name:
                 consumers[name].append(idx)
     return consumers
+
+
+def _build_producers(graph: CanonicalGraph) -> dict[str, int]:
+    producers: dict[str, int] = {}
+    for idx, node in enumerate(graph.nodes):
+        for name in node.outputs:
+            producers[name] = idx
+    return producers
 
 
 def _find_conv_activation_blocks(
@@ -93,7 +103,7 @@ def _find_vgg_stages(graph: CanonicalGraph) -> list[PatternGroup]:
     groups = []
     start = 0
     for idx, node in enumerate(graph.nodes):
-        if node.op_type not in {"MaxPool", "AveragePool"}:
+        if node.op_type != "MaxPool":
             continue
         indices = list(range(start, idx + 1))
         ops = [graph.nodes[i].op_type for i in indices]
@@ -132,6 +142,113 @@ def _find_residual_adds(
             )
         )
     return groups
+
+
+def _find_resnet_blocks(
+    graph: CanonicalGraph,
+    consumers: dict[str, list[int]],
+    producers: dict[str, int],
+) -> list[PatternGroup]:
+    groups = []
+    for idx, node in enumerate(graph.nodes):
+        if node.op_type != "Add":
+            continue
+        branches = [
+            _trace_residual_branch(graph, producers, input_name)
+            for input_name in node.inputs
+        ]
+        if len(branches) != 2:
+            continue
+        main_branch = max(branches, key=lambda branch: int(branch["conv_count"]))
+        shortcut_branch = min(branches, key=lambda branch: int(branch["conv_count"]))
+        common_conv_count = int(shortcut_branch["conv_count"])
+        shortcut_conv_count = 1 if bool(shortcut_branch["starts_with_conv"]) else 0
+        main_conv_count = (
+            int(main_branch["conv_count"]) - common_conv_count + shortcut_conv_count
+        )
+        if main_conv_count == 2:
+            pattern_type = "resnet_basic_block"
+        elif main_conv_count == 3:
+            pattern_type = "resnet_bottleneck_block"
+        else:
+            continue
+        indices = set(
+            _trim_branch_to_conv_count(
+                graph, main_branch["node_indices"], main_conv_count
+            )
+        )
+        if shortcut_conv_count:
+            indices.update(
+                _trim_branch_to_conv_count(
+                    graph, shortcut_branch["node_indices"], shortcut_conv_count
+                )
+            )
+        indices.add(idx)
+        post_relu_idx = _single_consumer_idx(graph, consumers, idx, expected_op="Relu")
+        if post_relu_idx is not None and post_relu_idx not in indices:
+            indices.add(post_relu_idx)
+        indices = sorted(indices)
+        groups.append(
+            _make_group(
+                graph,
+                pattern_type,
+                indices,
+                name=f"{pattern_type}_{len(groups)}",
+                attrs={
+                    "main_conv_count": main_conv_count,
+                    "shortcut_conv_count": shortcut_conv_count,
+                    "has_post_relu": post_relu_idx is not None,
+                },
+            )
+        )
+    return groups
+
+
+def _trace_residual_branch(
+    graph: CanonicalGraph,
+    producers: dict[str, int],
+    start_tensor: str,
+) -> dict[str, int | list[int]]:
+    tensor = start_tensor
+    node_indices: list[int] = []
+    conv_count = 0
+    starts_with_conv = False
+    seen: set[str] = set()
+    while tensor and tensor not in seen:
+        seen.add(tensor)
+        node_idx = producers.get(tensor)
+        if node_idx is None:
+            break
+        node = graph.nodes[node_idx]
+        if node.op_type not in {"Conv", "BatchNormalization", "Relu", "Identity"}:
+            break
+        if not node_indices:
+            starts_with_conv = node.op_type == "Conv"
+        node_indices.append(node_idx)
+        if node.op_type == "Conv":
+            conv_count += 1
+        if not node.inputs:
+            break
+        tensor = node.inputs[0]
+    return {
+        "node_indices": node_indices,
+        "conv_count": conv_count,
+        "starts_with_conv": starts_with_conv,
+    }
+
+
+def _trim_branch_to_conv_count(
+    graph: CanonicalGraph, node_indices: list[int], conv_limit: int
+) -> list[int]:
+    trimmed = []
+    conv_count = 0
+    for node_idx in node_indices:
+        trimmed.append(node_idx)
+        if graph.nodes[node_idx].op_type == "Conv":
+            conv_count += 1
+            if conv_count >= conv_limit:
+                break
+    return trimmed
 
 
 def _single_consumer_idx(

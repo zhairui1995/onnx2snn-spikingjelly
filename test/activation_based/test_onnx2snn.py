@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from spikingjelly.activation_based.ann2snn.sample_models import cifar10_resnet
 from spikingjelly.activation_based.onnx2snn import (
     ConversionConfig,
     UnsupportedONNXError,
@@ -183,6 +184,34 @@ def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
         ["Conv", "BatchNormalization", "Relu"],
         ["Conv", "Relu"],
     )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "constructor", "expected_pattern", "expected_blocks"),
+    [
+        ("resnet18", cifar10_resnet.ResNet18, "resnet_basic_block", 8),
+        ("resnet34", cifar10_resnet.ResNet34, "resnet_basic_block", 16),
+        ("resnet50", cifar10_resnet.ResNet50, "resnet_bottleneck_block", 16),
+    ],
+)
+def test_pattern_grouping_finds_resnet_blocks(
+    tmp_path: Path, model_name, constructor, expected_pattern, expected_blocks
+):
+    torch.manual_seed(4)
+    model = constructor().eval()
+    onnx_path = _export_onnx(
+        model, torch.rand(1, 3, 32, 32), tmp_path / f"{model_name}.onnx"
+    )
+    graph = load_onnx_graph(str(onnx_path))
+
+    groups = analyze_patterns(graph)
+    counts = {}
+    for group in groups:
+        counts[group.pattern_type] = counts.get(group.pattern_type, 0) + 1
+
+    assert counts["residual_add"] == expected_blocks
+    assert counts[expected_pattern] == expected_blocks
+    assert "vgg_stage" not in counts
 
 
 def test_unsupported_operator_report_is_explicit(tmp_path: Path):
