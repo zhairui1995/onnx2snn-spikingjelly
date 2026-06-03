@@ -12,6 +12,7 @@ SUPPORTED_OPS = {
     "Abs",
     "AveragePool",
     "BatchNormalization",
+    "Cast",
     "Clip",
     "Concat",
     "Constant",

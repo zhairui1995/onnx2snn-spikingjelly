@@ -70,6 +70,8 @@ class OnnxGraphModule(nn.Module):
             return inputs[0] + inputs[1]
         if node.op_type == "AveragePool":
             return _pool(inputs[0], node.attrs, mode="avg")
+        if node.op_type == "Cast":
+            return inputs[0].to(dtype=_cast_dtype(int(node.attrs["to"])))
         if node.op_type == "Clip":
             return torch.clamp(
                 inputs[0],
@@ -379,6 +381,21 @@ def _clip_bound(
         return inputs[input_idx]
     value = attrs.get(attr_name)
     return None if value is None else float(value)
+
+
+def _cast_dtype(onnx_dtype: int) -> torch.dtype:
+    return {
+        1: torch.float32,
+        2: torch.uint8,
+        3: torch.int8,
+        4: torch.uint16,
+        5: torch.int16,
+        6: torch.int32,
+        7: torch.int64,
+        9: torch.bool,
+        10: torch.float16,
+        11: torch.float64,
+    }.get(onnx_dtype, torch.float32)
 
 
 def _gather(data: torch.Tensor, indices: torch.Tensor, axis: int) -> torch.Tensor:

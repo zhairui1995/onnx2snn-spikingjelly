@@ -495,6 +495,7 @@ def test_convert_elementwise_operator_graph(tmp_path: Path):
         "Abs",
         "Clip",
         "Greater",
+        "Cast",
         "Where",
         "Dropout",
     ]:
@@ -911,9 +912,17 @@ def _make_elementwise_onnx(path: Path) -> Path:
             helper.make_node(
                 "Greater", inputs=["clip_out", "threshold"], outputs=["mask"]
             ),
+            helper.make_node(
+                "Cast", inputs=["mask"], outputs=["mask_float"], to=tensor_proto.FLOAT
+            ),
             helper.make_node("Add", inputs=["input", "bias"], outputs=["add_out"]),
             helper.make_node(
-                "Where", inputs=["mask", "clip_out", "add_out"], outputs=["where_out"]
+                "Add", inputs=["add_out", "mask_float"], outputs=["masked_add_out"]
+            ),
+            helper.make_node(
+                "Where",
+                inputs=["mask", "clip_out", "masked_add_out"],
+                outputs=["where_out"],
             ),
             helper.make_node(
                 "Dropout",
