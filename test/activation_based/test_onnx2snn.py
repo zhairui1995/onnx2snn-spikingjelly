@@ -171,6 +171,54 @@ class _MnistLeNet5Tanh(nn.Module):
         return self.classifier(self.features(x))
 
 
+class _MnistConvBnGap(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 12, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(12),
+            nn.ReLU(),
+            nn.Conv2d(12, 24, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=28),
+            nn.Flatten(),
+            nn.Linear(24, 10),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _MnistTinyResidual(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(),
+        )
+        self.conv1 = nn.Conv2d(8, 8, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(8)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(8, 8, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(8)
+        self.relu2 = nn.ReLU()
+        self.avgpool = nn.AvgPool2d(kernel_size=28)
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(8, 10)
+
+    def forward(self, x):
+        x = self.stem(x)
+        identity = x
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.relu2(out + identity)
+        out = self.avgpool(out)
+        out = self.flatten(out)
+        return self.fc(out)
+
+
 class _DepthwiseCnn(nn.Module):
     def __init__(self):
         super().__init__()
@@ -373,6 +421,46 @@ def test_convert_mnist_lenet5_and_mlp_models(
 
     for op_type, count in expected_ops.items():
         assert artifacts.report["op_counts"][op_type] == count
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    assert artifacts.report["structured_ann"]["allclose_1e_6"]
+    assert artifacts.report["calibration"]["relu_scales"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x[:2]).shape == (2, 10)
+        assert artifacts.snn_model(x[:2]).shape == (2, 10)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "model", "required_ops"),
+    [
+        (
+            "mnist_conv_bn_gap",
+            _MnistConvBnGap(),
+            {"Conv": 2, "Relu": 2, "AveragePool": 1},
+        ),
+        (
+            "mnist_tiny_residual",
+            _MnistTinyResidual(),
+            {"Conv": 3, "Relu": 3, "Add": 1},
+        ),
+    ],
+)
+def test_convert_additional_mnist_snn_models(
+    tmp_path: Path, model_name: str, model: nn.Module, required_ops
+):
+    torch.manual_seed(14)
+    model.eval()
+    x = torch.rand(4, 1, 28, 28)
+    onnx_path = _export_onnx(model, x, tmp_path / f"{model_name}.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / f"{model_name}_artifacts",
+        {"input_shape": (1, 1, 28, 28), "t": 3, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    for op_type, count in required_ops.items():
+        assert artifacts.report["op_counts"].get(op_type, 0) >= count
     assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
     assert artifacts.report["structured_ann"]["allclose_1e_6"]
     assert artifacts.report["calibration"]["relu_scales"]
