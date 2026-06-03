@@ -275,6 +275,94 @@ def test_convert_mnist_lenet5_and_mlp_models(
         assert artifacts.snn_model(x[:2]).shape == (2, 10)
 
 
+def test_convert_temporal_conv1d_graph(tmp_path: Path):
+    torch.manual_seed(8)
+    x = torch.rand(4, 2, 16)
+    onnx_path = _make_temporal_conv1d_onnx(tmp_path / "temporal_conv1d.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "temporal_conv1d_artifacts",
+        {"input_shape": (1, 2, 16), "t": 3, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    assert artifacts.report["op_counts"]["Conv"] == 1
+    assert artifacts.report["op_counts"]["BatchNormalization"] == 1
+    assert artifacts.report["op_counts"]["MaxPool"] == 1
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x[:2]).shape == (2, 5)
+        assert artifacts.snn_model(x[:2]).shape == (2, 5)
+
+
+def test_convert_conv3d_global_maxpool_graph(tmp_path: Path):
+    torch.manual_seed(9)
+    x = torch.rand(2, 1, 4, 4, 4)
+    onnx_path = _make_conv3d_global_maxpool_onnx(tmp_path / "conv3d_global_max.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "conv3d_global_max_artifacts",
+        {"input_shape": (1, 1, 4, 4, 4), "t": 2, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=1),
+    )
+
+    assert artifacts.report["op_counts"]["Conv"] == 1
+    assert artifacts.report["op_counts"]["BatchNormalization"] == 1
+    assert artifacts.report["op_counts"]["GlobalMaxPool"] == 1
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x).shape == (2, 3)
+
+
+def test_convert_elementwise_operator_graph(tmp_path: Path):
+    torch.manual_seed(10)
+    x = torch.rand(3, 4) - 0.5
+    onnx_path = _make_elementwise_onnx(tmp_path / "elementwise.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "elementwise_artifacts",
+        {"input_shape": (1, 4), "t": 1, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=3),
+    )
+
+    for op_type in [
+        "Mul",
+        "Sub",
+        "Div",
+        "Neg",
+        "Abs",
+        "Clip",
+        "Greater",
+        "Where",
+        "Dropout",
+    ]:
+        assert artifacts.report["op_counts"][op_type] == 1
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+
+
+def test_convert_shape_operator_graph(tmp_path: Path):
+    torch.manual_seed(11)
+    x = torch.rand(2, 1, 3, 1)
+    onnx_path = _make_shape_ops_onnx(tmp_path / "shape_ops.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "shape_ops_artifacts",
+        {"input_shape": (2, 1, 3, 1), "t": 1, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    for op_type in ["Unsqueeze", "Shape", "Gather", "Expand"]:
+        assert artifacts.report["op_counts"][op_type] == 1
+    assert artifacts.report["op_counts"]["Squeeze"] == 2
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x).shape == (2, 3)
+
+
 def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
     torch.manual_seed(3)
     model = _VggLikeMaxPoolNet().eval()
@@ -482,6 +570,260 @@ def _make_pad_constant_onnx(path: Path) -> Path:
     model = helper.make_model(
         graph,
         opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_temporal_conv1d_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+    rng = np.random.default_rng(8)
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv",
+                inputs=["input", "conv_weight"],
+                outputs=["conv_out"],
+                pads=[1, 1],
+            ),
+            helper.make_node(
+                "BatchNormalization",
+                inputs=["conv_out", "bn_scale", "bn_bias", "bn_mean", "bn_var"],
+                outputs=["bn_out"],
+                epsilon=1.0e-5,
+            ),
+            helper.make_node("Relu", inputs=["bn_out"], outputs=["relu_out"]),
+            helper.make_node(
+                "MaxPool",
+                inputs=["relu_out"],
+                outputs=["pooled"],
+                kernel_shape=[2],
+                strides=[2],
+            ),
+            helper.make_node("Flatten", inputs=["pooled"], outputs=["flat"], axis=1),
+            helper.make_node(
+                "Gemm",
+                inputs=["flat", "fc_weight", "fc_bias"],
+                outputs=["output"],
+                transB=1,
+            ),
+        ],
+        "temporal_conv1d_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [None, 2, 16])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [None, 5])
+        ],
+        initializer=[
+            numpy_helper.from_array(
+                rng.standard_normal((4, 2, 3)).astype(np.float32), name="conv_weight"
+            ),
+            numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="bn_scale"),
+            numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="bn_bias"),
+            numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="bn_mean"),
+            numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="bn_var"),
+            numpy_helper.from_array(
+                rng.standard_normal((5, 32)).astype(np.float32), name="fc_weight"
+            ),
+            numpy_helper.from_array(
+                rng.standard_normal((5,)).astype(np.float32), name="fc_bias"
+            ),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_conv3d_global_maxpool_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+    rng = np.random.default_rng(9)
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Conv",
+                inputs=["input", "conv_weight"],
+                outputs=["conv_out"],
+                pads=[1, 1, 1, 1, 1, 1],
+            ),
+            helper.make_node(
+                "BatchNormalization",
+                inputs=["conv_out", "bn_scale", "bn_bias", "bn_mean", "bn_var"],
+                outputs=["bn_out"],
+                epsilon=1.0e-5,
+            ),
+            helper.make_node("Relu", inputs=["bn_out"], outputs=["relu_out"]),
+            helper.make_node(
+                "GlobalMaxPool", inputs=["relu_out"], outputs=["pooled"]
+            ),
+            helper.make_node("Flatten", inputs=["pooled"], outputs=["flat"], axis=1),
+            helper.make_node(
+                "Gemm",
+                inputs=["flat", "fc_weight", "fc_bias"],
+                outputs=["output"],
+                transB=1,
+            ),
+        ],
+        "conv3d_global_maxpool_graph",
+        inputs=[
+            helper.make_tensor_value_info(
+                "input", tensor_proto.FLOAT, [None, 1, 4, 4, 4]
+            )
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [None, 3])
+        ],
+        initializer=[
+            numpy_helper.from_array(
+                rng.standard_normal((2, 1, 3, 3, 3)).astype(np.float32),
+                name="conv_weight",
+            ),
+            numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="bn_scale"),
+            numpy_helper.from_array(np.zeros((2,), dtype=np.float32), name="bn_bias"),
+            numpy_helper.from_array(np.zeros((2,), dtype=np.float32), name="bn_mean"),
+            numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="bn_var"),
+            numpy_helper.from_array(
+                rng.standard_normal((3, 2)).astype(np.float32), name="fc_weight"
+            ),
+            numpy_helper.from_array(
+                rng.standard_normal((3,)).astype(np.float32), name="fc_bias"
+            ),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_elementwise_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+
+    graph = helper.make_graph(
+        [
+            helper.make_node("Mul", inputs=["input", "scale"], outputs=["mul_out"]),
+            helper.make_node("Sub", inputs=["mul_out", "bias"], outputs=["sub_out"]),
+            helper.make_node("Div", inputs=["sub_out", "scale"], outputs=["div_out"]),
+            helper.make_node("Neg", inputs=["div_out"], outputs=["neg_out"]),
+            helper.make_node("Abs", inputs=["neg_out"], outputs=["abs_out"]),
+            helper.make_node(
+                "Clip", inputs=["abs_out", "clip_min", "clip_max"], outputs=["clip_out"]
+            ),
+            helper.make_node(
+                "Greater", inputs=["clip_out", "threshold"], outputs=["mask"]
+            ),
+            helper.make_node("Add", inputs=["input", "bias"], outputs=["add_out"]),
+            helper.make_node(
+                "Where", inputs=["mask", "clip_out", "add_out"], outputs=["where_out"]
+            ),
+            helper.make_node(
+                "Dropout",
+                inputs=["where_out"],
+                outputs=["output"],
+                ratio=0.5,
+            ),
+        ],
+        "elementwise_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [None, 4])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [None, 4])
+        ],
+        initializer=[
+            numpy_helper.from_array(np.array([2.0], dtype=np.float32), name="scale"),
+            numpy_helper.from_array(np.array([0.25], dtype=np.float32), name="bias"),
+            numpy_helper.from_array(np.array([0.0], dtype=np.float32), name="clip_min"),
+            numpy_helper.from_array(np.array([1.0], dtype=np.float32), name="clip_max"),
+            numpy_helper.from_array(
+                np.array([0.5], dtype=np.float32), name="threshold"
+            ),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_shape_ops_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Squeeze", inputs=["input", "squeeze_axes"], outputs=["squeezed"]
+            ),
+            helper.make_node(
+                "Unsqueeze",
+                inputs=["squeezed", "unsqueeze_axes"],
+                outputs=["unsqueezed"],
+            ),
+            helper.make_node(
+                "Squeeze",
+                inputs=["unsqueezed", "unsqueeze_axes"],
+                outputs=["resqueezed"],
+            ),
+            helper.make_node("Shape", inputs=["resqueezed"], outputs=["shape"]),
+            helper.make_node(
+                "Gather", inputs=["shape", "gather_indices"], outputs=["expand_shape"]
+            ),
+            helper.make_node(
+                "Expand", inputs=["one", "expand_shape"], outputs=["expanded"]
+            ),
+            helper.make_node(
+                "Add", inputs=["resqueezed", "expanded"], outputs=["output"]
+            ),
+        ],
+        "shape_ops_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [2, 1, 3, 1])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [2, 3])
+        ],
+        initializer=[
+            numpy_helper.from_array(
+                np.array([1, 3], dtype=np.int64), name="squeeze_axes"
+            ),
+            numpy_helper.from_array(
+                np.array([1], dtype=np.int64), name="unsqueeze_axes"
+            ),
+            numpy_helper.from_array(
+                np.array([0, 1], dtype=np.int64), name="gather_indices"
+            ),
+            numpy_helper.from_array(np.array([1.0], dtype=np.float32), name="one"),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 13)],
         ir_version=7,
     )
     onnx.save(model, str(path))
