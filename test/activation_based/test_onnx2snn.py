@@ -82,6 +82,46 @@ class _VggLikeMaxPoolNet(nn.Module):
         return self.net(x)
 
 
+class _MnistMlp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(28 * 28, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 10),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _MnistLeNet5(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 6, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(6, 16, kernel_size=5),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(16 * 5 * 5, 120),
+            nn.ReLU(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, 10),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
 class _UnsupportedSigmoid(nn.Module):
     def forward(self, x):
         return torch.sigmoid(x)
@@ -191,6 +231,48 @@ def test_convert_pad_constant_graph(tmp_path: Path):
             atol=1.0e-6,
             rtol=1.0e-6,
         )
+
+
+@pytest.mark.parametrize(
+    ("model_name", "model", "input_shape", "expected_ops"),
+    [
+        (
+            "mnist_mlp",
+            _MnistMlp(),
+            (1, 1, 28, 28),
+            {"Reshape": 1, "Gemm": 3, "Relu": 2},
+        ),
+        (
+            "mnist_lenet5",
+            _MnistLeNet5(),
+            (1, 1, 28, 28),
+            {"Conv": 2, "AveragePool": 2, "Reshape": 1, "Gemm": 3, "Relu": 4},
+        ),
+    ],
+)
+def test_convert_mnist_lenet5_and_mlp_models(
+    tmp_path: Path, model_name: str, model: nn.Module, input_shape, expected_ops
+):
+    torch.manual_seed(7)
+    model.eval()
+    x = torch.rand(4, *input_shape[1:])
+    onnx_path = _export_onnx(model, x, tmp_path / f"{model_name}.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / f"{model_name}_artifacts",
+        {"input_shape": input_shape, "t": 3, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    for op_type, count in expected_ops.items():
+        assert artifacts.report["op_counts"][op_type] == count
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    assert artifacts.report["structured_ann"]["allclose_1e_6"]
+    assert artifacts.report["calibration"]["relu_scales"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x[:2]).shape == (2, 10)
+        assert artifacts.snn_model(x[:2]).shape == (2, 10)
 
 
 def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
