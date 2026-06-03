@@ -52,7 +52,7 @@ def load_onnx_graph(onnx_path: str) -> CanonicalGraph:
         base = sanitize_name(node.name or f"{node.op_type.lower()}_{idx}", f"node_{idx}")
         name = _unique_name(base, used_names)
         module_name = None
-        if node.op_type in {"Conv", "BatchNormalization", "Gemm", "Relu"}:
+        if node.op_type in {"Conv", "BatchNormalization", "Gemm", "Relu", "Tanh"}:
             module_name = f"op_{idx}_{sanitize_name(node.op_type.lower(), 'op')}"
             module_kinds[module_name] = node.op_type
         nodes.append(
@@ -131,4 +131,3 @@ def tensor_proto_dtype_to_numpy(dtype: int):
         TensorProto.INT32: np.int32,
         TensorProto.BOOL: np.bool_,
     }.get(dtype, np.float32)
-

@@ -122,6 +122,112 @@ class _MnistLeNet5(nn.Module):
         return self.classifier(self.features(x))
 
 
+class _AlexNetSmall(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=8),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 10),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
+class _MnistLeNet5Tanh(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 6, kernel_size=5, padding=2),
+            nn.Tanh(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(6, 16, kernel_size=5),
+            nn.Tanh(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(16 * 5 * 5, 120),
+            nn.Tanh(),
+            nn.Linear(120, 84),
+            nn.Tanh(),
+            nn.Linear(84, 10),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
+class _DepthwiseCnn(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 3, kernel_size=3, padding=1, groups=3),
+            nn.ReLU(),
+            nn.Conv2d(3, 8, kernel_size=1),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=32),
+            nn.Flatten(),
+            nn.Linear(8, 10),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _FireModule(nn.Module):
+    def __init__(self, in_channels, squeeze_channels, expand_channels):
+        super().__init__()
+        self.squeeze = nn.Conv2d(in_channels, squeeze_channels, kernel_size=1)
+        self.squeeze_relu = nn.ReLU()
+        self.expand1x1 = nn.Conv2d(squeeze_channels, expand_channels, kernel_size=1)
+        self.expand1x1_relu = nn.ReLU()
+        self.expand3x3 = nn.Conv2d(
+            squeeze_channels, expand_channels, kernel_size=3, padding=1
+        )
+        self.expand3x3_relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.squeeze_relu(self.squeeze(x))
+        return torch.cat(
+            [
+                self.expand1x1_relu(self.expand1x1(x)),
+                self.expand3x3_relu(self.expand3x3(x)),
+            ],
+            dim=1,
+        )
+
+
+class _SqueezeNetSmall(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            _FireModule(8, 4, 8),
+            _FireModule(16, 4, 8),
+            nn.AvgPool2d(kernel_size=16),
+        )
+        self.classifier = nn.Sequential(nn.Flatten(), nn.Linear(16, 10))
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+
 class _UnsupportedSigmoid(nn.Module):
     def forward(self, x):
         return torch.sigmoid(x)
@@ -275,6 +381,59 @@ def test_convert_mnist_lenet5_and_mlp_models(
         assert artifacts.snn_model(x[:2]).shape == (2, 10)
 
 
+@pytest.mark.parametrize(
+    ("model_name", "model", "input_shape", "required_ops"),
+    [
+        (
+            "alexnet_small",
+            _AlexNetSmall(),
+            (1, 3, 32, 32),
+            {"Conv": 3, "Relu": 4, "MaxPool": 2, "AveragePool": 1, "Gemm": 2},
+        ),
+        (
+            "mnist_lenet5_tanh",
+            _MnistLeNet5Tanh(),
+            (1, 1, 28, 28),
+            {"Conv": 2, "Tanh": 4, "AveragePool": 2, "Gemm": 3},
+        ),
+        (
+            "depthwise_cnn",
+            _DepthwiseCnn(),
+            (1, 3, 32, 32),
+            {"Conv": 2, "Relu": 2, "AveragePool": 1, "Gemm": 1},
+        ),
+        (
+            "squeezenet_small",
+            _SqueezeNetSmall(),
+            (1, 3, 32, 32),
+            {"Conv": 7, "Relu": 7, "Concat": 2, "MaxPool": 1, "Gemm": 1},
+        ),
+    ],
+)
+def test_convert_additional_classification_models(
+    tmp_path: Path, model_name: str, model: nn.Module, input_shape, required_ops
+):
+    torch.manual_seed(12)
+    model.eval()
+    x = torch.rand(4, *input_shape[1:])
+    onnx_path = _export_onnx(model, x, tmp_path / f"{model_name}.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / f"{model_name}_artifacts",
+        {"input_shape": input_shape, "t": 3, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    for op_type, count in required_ops.items():
+        assert artifacts.report["op_counts"].get(op_type, 0) >= count
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    assert artifacts.report["structured_ann"]["allclose_1e_6"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x[:2]).shape == (2, 10)
+        assert artifacts.snn_model(x[:2]).shape == (2, 10)
+
+
 def test_convert_temporal_conv1d_graph(tmp_path: Path):
     torch.manual_seed(8)
     x = torch.rand(4, 2, 16)
@@ -361,6 +520,26 @@ def test_convert_shape_operator_graph(tmp_path: Path):
     assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
     with torch.no_grad():
         assert artifacts.ann_model(x).shape == (2, 3)
+
+
+def test_convert_slice_split_concat_graph(tmp_path: Path):
+    torch.manual_seed(13)
+    x = torch.rand(2, 4, 5)
+    onnx_path = _make_slice_split_concat_onnx(tmp_path / "slice_split_concat.onnx")
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "slice_split_concat_artifacts",
+        {"input_shape": (2, 4, 5), "t": 1, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=2),
+    )
+
+    assert artifacts.report["op_counts"]["Slice"] == 1
+    assert artifacts.report["op_counts"]["Split"] == 1
+    assert artifacts.report["op_counts"]["Concat"] == 1
+    assert artifacts.report["onnx_vs_ann"]["allclose_1e_4"]
+    with torch.no_grad():
+        assert artifacts.ann_model(x).shape == (2, 4, 3)
 
 
 def test_pattern_grouping_finds_editable_vgg_stages(tmp_path: Path):
@@ -819,6 +998,55 @@ def _make_shape_ops_onnx(path: Path) -> Path:
                 np.array([0, 1], dtype=np.int64), name="gather_indices"
             ),
             numpy_helper.from_array(np.array([1.0], dtype=np.float32), name="one"),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 13)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_slice_split_concat_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Slice",
+                inputs=["input", "starts", "ends", "axes", "steps"],
+                outputs=["sliced"],
+            ),
+            helper.make_node(
+                "Split",
+                inputs=["sliced", "split_sizes"],
+                outputs=["left", "right"],
+                axis=1,
+            ),
+            helper.make_node(
+                "Concat", inputs=["right", "left"], outputs=["output"], axis=1
+            ),
+        ],
+        "slice_split_concat_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [2, 4, 5])
+        ],
+        outputs=[
+            helper.make_tensor_value_info("output", tensor_proto.FLOAT, [2, 4, 3])
+        ],
+        initializer=[
+            numpy_helper.from_array(np.array([1], dtype=np.int64), name="starts"),
+            numpy_helper.from_array(np.array([4], dtype=np.int64), name="ends"),
+            numpy_helper.from_array(np.array([2], dtype=np.int64), name="axes"),
+            numpy_helper.from_array(np.array([1], dtype=np.int64), name="steps"),
+            numpy_helper.from_array(
+                np.array([2, 2], dtype=np.int64), name="split_sizes"
+            ),
         ],
     )
     model = helper.make_model(

@@ -151,6 +151,10 @@ class OnnxGraphModule(nn.Module):
             return torch.tensor(
                 shape[start:end], dtype=torch.long, device=inputs[0].device
             )
+        if node.op_type == "Slice":
+            return _slice(inputs, node.attrs)
+        if node.op_type == "Split":
+            return _split(inputs, node.attrs, len(node.outputs))
         if node.op_type == "Squeeze":
             axes = _axes_from_inputs_or_attrs(inputs, node.attrs)
             if axes is None:
@@ -161,6 +165,8 @@ class OnnxGraphModule(nn.Module):
             return out
         if node.op_type == "Sub":
             return inputs[0] - inputs[1]
+        if node.op_type == "Tanh":
+            return torch.tanh(inputs[0])
         if node.op_type == "Transpose":
             perm = node.attrs.get("perm")
             return inputs[0].permute(*perm) if perm is not None else inputs[0].t()
@@ -190,6 +196,8 @@ def build_ann_model(graph: CanonicalGraph) -> OnnxGraphModule:
             modules[node.module_name] = _build_gemm(graph, node)
         elif node.op_type == "Relu":
             modules[node.module_name] = nn.ReLU()
+        elif node.op_type == "Tanh":
+            modules[node.module_name] = nn.Tanh()
     model = OnnxGraphModule(graph, modules)
     model.eval()
     return model
@@ -396,6 +404,51 @@ def _onnx_pads_to_torch(pads: list[int]) -> list[int]:
 
 def _shape_from_tensor(shape: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(v) for v in shape.detach().cpu().flatten().tolist())
+
+
+def _slice(inputs: list[torch.Tensor], attrs: dict[str, Any]) -> torch.Tensor:
+    data = inputs[0]
+    starts = _int_list_from_input_or_attr(inputs, attrs, 1, "starts")
+    ends = _int_list_from_input_or_attr(inputs, attrs, 2, "ends")
+    axes = _int_list_from_input_or_attr(inputs, attrs, 3, "axes")
+    steps = _int_list_from_input_or_attr(inputs, attrs, 4, "steps")
+    if axes is None:
+        axes = list(range(len(starts)))
+    if steps is None:
+        steps = [1] * len(starts)
+    slices = [slice(None)] * data.dim()
+    for start, end, axis, step in zip(starts, ends, axes, steps):
+        axis = axis if axis >= 0 else axis + data.dim()
+        dim = data.shape[axis]
+        start = start + dim if start < 0 else start
+        end = end + dim if end < 0 else end
+        if end >= np.iinfo(np.int32).max:
+            end = None
+        slices[axis] = slice(start, end, step)
+    return data[tuple(slices)]
+
+
+def _split(
+    inputs: list[torch.Tensor], attrs: dict[str, Any], output_count: int
+) -> tuple[torch.Tensor, ...]:
+    axis = int(attrs.get("axis", 0))
+    if len(inputs) > 1:
+        split_sizes = [int(v) for v in inputs[1].detach().cpu().flatten().tolist()]
+        return tuple(torch.split(inputs[0], split_sizes, dim=axis))
+    if "split" in attrs:
+        return tuple(torch.split(inputs[0], [int(v) for v in attrs["split"]], dim=axis))
+    return tuple(torch.chunk(inputs[0], output_count, dim=axis))
+
+
+def _int_list_from_input_or_attr(
+    inputs: list[torch.Tensor], attrs: dict[str, Any], input_idx: int, attr_name: str
+) -> list[int] | None:
+    if len(inputs) > input_idx:
+        return [int(v) for v in inputs[input_idx].detach().cpu().flatten().tolist()]
+    value = attrs.get(attr_name)
+    if value is None:
+        return None
+    return [int(v) for v in value]
 
 
 def _buffer_name(name: str) -> str:
