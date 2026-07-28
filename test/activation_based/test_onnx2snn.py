@@ -1,4 +1,8 @@
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -385,6 +389,69 @@ def test_convert_pad_constant_graph(tmp_path: Path):
             atol=1.0e-6,
             rtol=1.0e-6,
         )
+
+
+def test_convert_constant_embedded_parameter_graph(tmp_path: Path):
+    torch.manual_seed(7)
+    x = torch.rand(1, 1, 4, 4)
+    y = torch.tensor([1])
+    onnx_path = _make_constant_embedded_parameter_onnx(
+        tmp_path / "constant_parameters.onnx"
+    )
+
+    graph = load_onnx_graph(str(onnx_path))
+    assert {"conv_weight", "conv_bias", "fc_weight", "out_shape"} <= set(
+        graph.initializers
+    )
+    assert "offset" in graph.initializers
+    assert graph.initializers["offset"].shape == ()
+
+    artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "constant_parameter_artifacts",
+        {"input_shape": (1, 1, 4, 4), "t": 2, "compare_onnxruntime": True},
+        calibration_loader=DataLoader(TensorDataset(x), batch_size=1),
+        eval_loader=DataLoader(TensorDataset(x, y), batch_size=1),
+    )
+
+    assert artifacts.report["op_counts"]["Constant"] == 5
+    assert artifacts.report["onnx_vs_ann"]["status"] == "ok"
+    assert artifacts.report["evaluation"]["num_samples"] == 1
+    with torch.no_grad():
+        assert artifacts.ann_model(x).shape == (3,)
+        assert artifacts.snn_model(x).shape == (3,)
+
+    batch_path = tmp_path / "constant_parameter_batch.pt"
+    torch.save((x, y), batch_path)
+    env = os.environ.copy()
+    repo_root = str(Path(__file__).resolve().parents[2])
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in [repo_root, env.get("PYTHONPATH")] if value
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(tmp_path / "constant_parameter_artifacts" / "evaluate.py"),
+            "--batch",
+            str(batch_path),
+            "--steps",
+            "2",
+        ],
+        cwd=tmp_path / "constant_parameter_artifacts",
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+    assert set(result) == {"ann_accuracy", "snn_accuracy"}
+
+    synthetic_artifacts = convert_onnx_to_snn(
+        onnx_path,
+        tmp_path / "constant_parameter_synthetic_artifacts",
+        {"input_shape": (1, 1, 4, 4), "t": 2, "compare_onnxruntime": False},
+    )
+    assert synthetic_artifacts.report["synthetic_calibration_used"] is True
 
 
 @pytest.mark.parametrize(
@@ -838,6 +905,95 @@ def _make_pad_constant_onnx(path: Path) -> Path:
     model = helper.make_model(
         graph,
         opset_imports=[helper.make_operatorsetid("", 11)],
+        ir_version=7,
+    )
+    onnx.save(model, str(path))
+    onnx.checker.check_model(str(path))
+    return path
+
+
+def _make_constant_embedded_parameter_onnx(path: Path) -> Path:
+    helper = onnx.helper
+    numpy_helper = onnx.numpy_helper
+    tensor_proto = onnx.TensorProto
+    rng = np.random.default_rng(7)
+
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["conv_weight"],
+                value=numpy_helper.from_array(
+                    rng.standard_normal((2, 1, 3, 3)).astype(np.float32),
+                    name="conv_weight_tensor",
+                ),
+            ),
+            helper.make_node(
+                "Conv",
+                inputs=["input", "conv_weight"],
+                outputs=["conv_out"],
+                pads=[1, 1, 1, 1],
+            ),
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["conv_bias"],
+                value=numpy_helper.from_array(
+                    rng.standard_normal((1, 2, 1, 1)).astype(np.float32),
+                    name="conv_bias_tensor",
+                ),
+            ),
+            helper.make_node(
+                "Add", inputs=["conv_out", "conv_bias"], outputs=["biased"]
+            ),
+            helper.make_node(
+                "Constant", inputs=[], outputs=["offset"], value_float=0.25
+            ),
+            helper.make_node(
+                "Add", inputs=["biased", "offset"], outputs=["offset_biased"]
+            ),
+            helper.make_node(
+                "Relu", inputs=["offset_biased"], outputs=["relu_out"]
+            ),
+            helper.make_node(
+                "ReduceMean",
+                inputs=["relu_out"],
+                outputs=["pooled"],
+                axes=[2, 3],
+                keepdims=0,
+            ),
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["fc_weight"],
+                value=numpy_helper.from_array(
+                    rng.standard_normal((2, 3)).astype(np.float32),
+                    name="fc_weight_tensor",
+                ),
+            ),
+            helper.make_node(
+                "MatMul", inputs=["pooled", "fc_weight"], outputs=["logits_2d"]
+            ),
+            helper.make_node(
+                "Constant",
+                inputs=[],
+                outputs=["out_shape"],
+                value_ints=[3],
+            ),
+            helper.make_node(
+                "Reshape", inputs=["logits_2d", "out_shape"], outputs=["output"]
+            ),
+        ],
+        "constant_embedded_parameter_graph",
+        inputs=[
+            helper.make_tensor_value_info("input", tensor_proto.FLOAT, [1, 1, 4, 4])
+        ],
+        outputs=[helper.make_tensor_value_info("output", tensor_proto.FLOAT, [3])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_operatorsetid("", 13)],
         ir_version=7,
     )
     onnx.save(model, str(path))

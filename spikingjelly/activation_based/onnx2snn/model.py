@@ -81,6 +81,12 @@ class OnnxGraphModule(nn.Module):
         if node.op_type == "Concat":
             return torch.cat(inputs, dim=int(node.attrs.get("axis", 0)))
         if node.op_type == "Constant":
+            if node.outputs and node.outputs[0] in self.graph.initializers:
+                return getattr(self, _buffer_name(node.outputs[0]))
+            if "value" not in node.attrs:
+                raise ValueError(
+                    f"Constant node {node.name!r} was not materialized as a numeric tensor"
+                )
             return torch.as_tensor(node.attrs["value"])
         if node.op_type == "Div":
             return inputs[0] / inputs[1]
@@ -245,10 +251,10 @@ def build_snn_model(
 
 
 def _build_conv(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
-    weight = torch.as_tensor(graph.initializers[node.inputs[1]]).float()
+    weight = _initializer_tensor(graph, node.inputs[1]).float()
     bias = None
     if len(node.inputs) > 2 and node.inputs[2] in graph.initializers:
-        bias = torch.as_tensor(graph.initializers[node.inputs[2]]).float()
+        bias = _initializer_tensor(graph, node.inputs[2]).float()
     dims = weight.dim() - 2
     if dims not in {1, 2, 3}:
         raise ValueError("onnx2snn v1 supports Conv1d/2d/3d only")
@@ -276,10 +282,10 @@ def _build_conv(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
 
 
 def _build_batch_norm(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
-    scale = torch.as_tensor(graph.initializers[node.inputs[1]]).float()
-    bias = torch.as_tensor(graph.initializers[node.inputs[2]]).float()
-    mean = torch.as_tensor(graph.initializers[node.inputs[3]]).float()
-    var = torch.as_tensor(graph.initializers[node.inputs[4]]).float()
+    scale = _initializer_tensor(graph, node.inputs[1]).float()
+    bias = _initializer_tensor(graph, node.inputs[2]).float()
+    mean = _initializer_tensor(graph, node.inputs[3]).float()
+    var = _initializer_tensor(graph, node.inputs[4]).float()
     eps = float(node.attrs.get("epsilon", 1.0e-5))
     shape = graph.value_shapes.get(node.inputs[0], ())
     cls = {5: nn.BatchNorm3d, 4: nn.BatchNorm2d}.get(len(shape), nn.BatchNorm1d)
@@ -293,10 +299,10 @@ def _build_batch_norm(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
 
 
 def _build_gemm(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
-    b = torch.as_tensor(graph.initializers[node.inputs[1]]).float()
+    b = _initializer_tensor(graph, node.inputs[1]).float()
     c = None
     if len(node.inputs) > 2 and node.inputs[2] in graph.initializers:
-        c = torch.as_tensor(graph.initializers[node.inputs[2]]).float()
+        c = _initializer_tensor(graph, node.inputs[2]).float()
     alpha = float(node.attrs.get("alpha", 1.0))
     beta = float(node.attrs.get("beta", 1.0))
     trans_b = int(node.attrs.get("transB", 0))
@@ -308,6 +314,13 @@ def _build_gemm(graph: CanonicalGraph, node: CanonicalNode) -> nn.Module:
     if c is not None:
         linear.bias.data.copy_(c)
     return linear
+
+
+def _initializer_tensor(graph: CanonicalGraph, name: str) -> torch.Tensor:
+    try:
+        return torch.as_tensor(graph.initializers[name])
+    except KeyError as exc:
+        raise KeyError(f"Missing ONNX initializer or Constant tensor for {name!r}") from exc
 
 
 def _pool(x: torch.Tensor, attrs: dict[str, Any], mode: str):

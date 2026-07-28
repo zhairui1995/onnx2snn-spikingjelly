@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 import numpy as np
-from onnx import TensorProto, checker, load, numpy_helper, shape_inference
+from onnx import TensorProto, checker, helper, load, numpy_helper, shape_inference
 
 from .core import SUPPORTED_OPS, CanonicalGraph, CanonicalNode, UnsupportedONNXError
 
@@ -29,6 +29,7 @@ def load_onnx_graph(onnx_path: str) -> CanonicalGraph:
         tensor.name: numpy_helper.to_array(tensor).copy()
         for tensor in graph.initializer
     }
+    initializers.update(_constant_node_initializers(graph.node, initializers))
     initializer_names = set(initializers)
     input_names = [
         value.name for value in graph.input if value.name not in initializer_names
@@ -102,6 +103,46 @@ def _collect_value_shapes(model) -> dict[str, tuple[int | None, ...]]:
                 dims.append(None)
         shapes[value.name] = tuple(dims)
     return shapes
+
+
+def _constant_node_initializers(
+    nodes, existing: dict[str, np.ndarray]
+) -> dict[str, np.ndarray]:
+    constants: dict[str, np.ndarray] = {}
+    numeric_attributes = {
+        "value",
+        "value_float",
+        "value_int",
+        "value_floats",
+        "value_ints",
+    }
+    for node in nodes:
+        if node.op_type != "Constant" or len(node.output) != 1:
+            continue
+        output_name = node.output[0]
+        if not output_name or output_name in existing:
+            continue
+        attributes = [attr for attr in node.attribute if attr.name in numeric_attributes]
+        if not attributes:
+            raise ValueError(
+                f"Constant node {output_name!r} must use a numeric value attribute"
+            )
+        if len(attributes) > 1:
+            raise ValueError(
+                f"Constant node {output_name!r} has multiple value attributes"
+            )
+        attribute = attributes[0]
+        if attribute.type == attribute.AttributeType.TENSOR:
+            value = numpy_helper.to_array(attribute.t)
+        else:
+            value = helper.get_attribute_value(attribute)
+        array = np.asarray(value)
+        if array.dtype.kind not in "biuf":
+            raise ValueError(
+                f"Constant node {output_name!r} has unsupported dtype {array.dtype}"
+            )
+        constants[output_name] = array.copy()
+    return constants
 
 
 def _attribute_to_python(attr) -> Any:

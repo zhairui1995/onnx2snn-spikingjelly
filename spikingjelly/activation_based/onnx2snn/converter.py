@@ -122,7 +122,12 @@ def _materialize_calibration_batches(
         raise ValueError(
             "No calibration_loader was provided and input_shape could not be inferred"
         )
-    shape = tuple(cfg.synthetic_batch_size if idx == 0 else int(dim) for idx, dim in enumerate(shape))
+    graph_shape = graph.value_shapes.get(graph.input_names[0], ())
+    if graph_shape and graph_shape[0] is not None and graph_shape[0] > 0:
+        batch_size = int(graph_shape[0])
+    else:
+        batch_size = int(cfg.synthetic_batch_size)
+    shape = tuple(batch_size if idx == 0 else int(dim) for idx, dim in enumerate(shape))
     generator = torch.Generator(device="cpu").manual_seed(0)
     batches = [
         torch.rand(shape, generator=generator).to(cfg.device)
@@ -267,19 +272,19 @@ def _evaluate_models(
         for batch in loader:
             x, y = batch[0].to(cfg.device).float(), batch[1].to(cfg.device)
             ann_out = ann_model(x)
-            ann_correct += (ann_out.argmax(dim=1) == y).sum().item()
+            ann_correct += (_predicted_classes(ann_out) == y).sum().item()
             if surrogate_ann_model is not None:
                 surrogate_ann_out = surrogate_ann_model(x)
                 surrogate_ann_correct += (
-                    surrogate_ann_out.argmax(dim=1) == y
+                    _predicted_classes(surrogate_ann_out) == y
                 ).sum().item()
             functional.reset_net(snn_model)
             snn_sum = None
             for t in range(cfg.t):
                 out = snn_model(x)
                 snn_sum = out if snn_sum is None else snn_sum + out
-                acc_curve[t] += (snn_sum.argmax(dim=1) == y).sum().item()
-            snn_correct += (snn_sum.argmax(dim=1) == y).sum().item()
+                acc_curve[t] += (_predicted_classes(snn_sum) == y).sum().item()
+            snn_correct += (_predicted_classes(snn_sum) == y).sum().item()
             total += y.numel()
     ann_metric = ann_correct / total if total else 0.0
     snn_metric = snn_correct / total if total else 0.0
@@ -296,6 +301,12 @@ def _evaluate_models(
         "snn_accuracy_curve": (acc_curve / total).tolist() if total else [],
         "num_samples": total,
     }
+
+
+def _predicted_classes(logits: torch.Tensor) -> torch.Tensor:
+    if logits.dim() == 1:
+        return logits.unsqueeze(0).argmax(dim=1)
+    return logits.argmax(dim=1)
 
 
 def _write_artifacts(
@@ -381,6 +392,12 @@ import torch
 from spikingjelly.activation_based import functional
 
 
+def _predicted_classes(logits):
+    if logits.dim() == 1:
+        return logits.unsqueeze(0).argmax(dim=1)
+    return logits.argmax(dim=1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", required=True, help="Path to a .pt file containing (x, y)")
@@ -398,8 +415,8 @@ def main():
             out = snn(x)
             snn_sum = out if snn_sum is None else snn_sum + out
     result = {
-        "ann_accuracy": float((ann_out.argmax(1) == y).float().mean()),
-        "snn_accuracy": float((snn_sum.argmax(1) == y).float().mean()),
+        "ann_accuracy": float((_predicted_classes(ann_out) == y).float().mean()),
+        "snn_accuracy": float((_predicted_classes(snn_sum) == y).float().mean()),
     }
     print(json.dumps(result, indent=2, sort_keys=True))
 
